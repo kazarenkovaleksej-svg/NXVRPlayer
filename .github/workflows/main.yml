@@ -17,9 +17,10 @@ jobs:
             switch-pkg-config switch-sdl2 switch-ffmpeg switch-glad switch-mesa
 
       - name: Build
+        working-directory: NXVRPlayer
         run: make -j$(nproc)
 
       - uses: actions/upload-artifact@v4
         with:
           name: NXVRPlayer
-          path: NXVRPlayer.nro
+          path: NXVRPlayer/NXVRPlayer.nro
