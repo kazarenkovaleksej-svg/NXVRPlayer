@@ -1,47 +1,50 @@
-// Отслеживание поворота головы по гироскопу Joy-Con / Pro Controller.
-// Используем поле `angle` датчика (накопленный угол, 1.0 = один оборот):
-// берём приращения за кадр и поворачиваем кватернион камеры в её локальной системе.
+// Отслеживание поворота по гироскопу Joy-Con / Pro Controller.
+//
+// Ориентация хранится как два угла: поворот влево/вправо вокруг вертикали (yaw)
+// и наклон вверх/вниз (pitch). Крена нет — горизонт всегда ровный, поэтому
+// картинка не «заваливается» даже после многих поворотов.
+//
+// - yaw: приращение поворота консоли, пересчитанное на вертикальную ось мира;
+// - pitch: гироскоп + плавная поправка по акселерометру (направлению силы
+//   тяжести), так что наклон вверх/вниз со временем не уплывает.
+// Уход по горизонтали (yaw) без компаса полностью убрать нельзя — для этого
+// есть кнопка X («смотреть прямо»).
 #include <math.h>
 #include <string.h>
 #include "gyro.h"
 
-// ---- Настройка осей ----------------------------------------------------------
-// Если в очках картинка поворачивается «не туда» (например, наклоняется вместо
-// поворота или крутится в обратную сторону) — поменяйте индекс оси (0=x,1=y,2=z)
-// или знак (+1/-1) здесь и пересоберите.
-#define PITCH_AXIS 0   // кивок вверх/вниз
+// ---- Настройка осей датчика ---------------------------------------------------
+#define PITCH_AXIS 0       // кивок вверх/вниз
 #define PITCH_SIGN (+1.0f)
-#define YAW_AXIS   1   // поворот влево/вправо
-#define YAW_SIGN   (-1.0f)
-#define ROLL_AXIS  2   // наклон головы к плечу
-#define ROLL_SIGN  (+1.0f)
+#define YAW_AXIS   1       // поворот влево/вправо
+#define YAW_SIGN   (+1.0f) // +1: поворот консоли вправо — взгляд вправо
 // -----------------------------------------------------------------------------
 
-#define TWO_PI 6.28318530718f
+#define TWO_PI      6.28318530718f
+#define PITCH_LIMIT 1.50f   // ~86°
+#define ACC_TAU     1.0f    // за сколько секунд акселерометр подтягивает наклон
 
 static HidSixAxisSensorHandle s_h[4]; // 0: handheld, 1: Pro, 2-3: Joy-Con пара (L, R)
-static float s_q[4];                   // ориентация камеры (w, x, y, z)
 static float s_prev[3];
 static bool  s_have_prev;
+
+static float s_yaw, s_pitch;          // от гироскопа (рад)
 static float s_stick_yaw, s_stick_pitch;
-static float s_yaw_user = 1.0f;       // -1: инвертировать поворот влево/вправо (кнопка в плеере)
+static float s_yaw_user = 1.0f;       // -1: инвертировать поворот (нажатие левого стика)
+
+// акселерометр
+static float s_up[3];                 // сглаженное направление «вверх» в осях датчика
+static bool  s_have_up;
+static float s_ref_ang;               // угол «вверх» в плоскости кивка в момент сброса
+static bool  s_have_ref;
+static float s_prev_acc_pitch;
+static float s_corr;                  // согласование знака гироскопа и акселерометра
+
+// автоподстройка смещения гироскопа, пока консоль неподвижна
+static float s_bias[3];               // рад/с
+static float s_still;                 // сколько секунд консоль неподвижна
 
 bool gyro_toggle_yaw_invert(void) { s_yaw_user = -s_yaw_user; return s_yaw_user < 0; }
-
-static void q_identity(float *q) { q[0] = 1; q[1] = q[2] = q[3] = 0; }
-
-static void q_mul(float *r, const float *a, const float *b) {
-    float w = a[0]*b[0] - a[1]*b[1] - a[2]*b[2] - a[3]*b[3];
-    float x = a[0]*b[1] + a[1]*b[0] + a[2]*b[3] - a[3]*b[2];
-    float y = a[0]*b[2] - a[1]*b[3] + a[2]*b[0] + a[3]*b[1];
-    float z = a[0]*b[3] + a[1]*b[2] - a[2]*b[1] + a[3]*b[0];
-    r[0] = w; r[1] = x; r[2] = y; r[3] = z;
-}
-
-static void q_normalize(float *q) {
-    float n = sqrtf(q[0]*q[0] + q[1]*q[1] + q[2]*q[2] + q[3]*q[3]);
-    if (n > 0) for (int i = 0; i < 4; i++) q[i] /= n;
-}
 
 void gyro_init(void) {
     hidGetSixAxisSensorHandles(&s_h[0], 1, HidNpadIdType_Handheld, HidNpadStyleTag_NpadHandheld);
@@ -56,9 +59,16 @@ void gyro_exit(void) {
 }
 
 void gyro_recenter(void) {
-    q_identity(s_q);
-    s_have_prev = false;
+    s_yaw = s_pitch = 0;
     s_stick_yaw = s_stick_pitch = 0;
+    s_have_prev = false;
+    s_have_ref = false;   // текущий наклон консоли станет «прямо»
+}
+
+static float wrap_pi(float a) {
+    while (a >  (float)M_PI) a -= TWO_PI;
+    while (a < -(float)M_PI) a += TWO_PI;
+    return a;
 }
 
 void gyro_update(PadState *pad, float dt) {
@@ -70,31 +80,76 @@ void gyro_update(PadState *pad, float dt) {
     else if (style & HidNpadStyleTag_NpadJoyDual)  n = hidGetSixAxisSensorStates(s_h[3], &st, 1); // правый Joy-Con
 
     if (n > 0 && (st.attributes & HidSixAxisSensorAttribute_IsConnected)) {
+        // --- гироскоп ---
         float cur[3] = { st.angle.x, st.angle.y, st.angle.z };
+        float dpitch = 0;
         if (s_have_prev) {
             float d[3];
             for (int i = 0; i < 3; i++) {
                 d[i] = cur[i] - s_prev[i];
-                d[i] -= roundf(d[i]);          // защита от перехода через целый оборот
-                d[i] *= TWO_PI;                // в радианы
+                d[i] -= roundf(d[i]);      // переход через целый оборот
+                d[i] *= TWO_PI;            // в радианы
             }
-            // вектор малого поворота в системе камеры (x вправо, y вверх, z назад)
-            float v[3] = { PITCH_SIGN * d[PITCH_AXIS], s_yaw_user * YAW_SIGN * d[YAW_AXIS], ROLL_SIGN * d[ROLL_AXIS] };
-            float ang = sqrtf(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]);
-            if (ang > 1e-6f && ang < 1.0f) {
-                float s = sinf(ang * 0.5f) / ang;
-                float dq[4] = { cosf(ang * 0.5f), v[0]*s, v[1]*s, v[2]*s };
-                float r[4];
-                q_mul(r, s_q, dq);
-                memcpy(s_q, r, sizeof(r));
-                q_normalize(s_q);
+            if (fabsf(d[0]) < 1.0f && fabsf(d[1]) < 1.0f && fabsf(d[2]) < 1.0f && dt > 0) {
+                // неподвижна, если все скорости (за вычетом смещения) меньше ~3°/с
+                bool still = true;
+                for (int i = 0; i < 3; i++)
+                    if (fabsf(d[i] / dt - s_bias[i]) > 0.05f) still = false;
+                s_still = still ? s_still + dt : 0;
+                if (s_still > 0.5f) {
+                    float k = 1.0f - expf(-dt / 3.0f);
+                    for (int i = 0; i < 3; i++) s_bias[i] += (d[i] / dt - s_bias[i]) * k;
+                }
+                for (int i = 0; i < 3; i++) d[i] -= s_bias[i] * dt;
+
+                dpitch = PITCH_SIGN * d[PITCH_AXIS];
+                // поворот вокруг вертикали мира: при наклонённой консоли датчик
+                // видит только cos(pitch) от него — компенсируем
+                float c = cosf(s_pitch);
+                if (c < 0.3f) c = 0.3f;
+                s_yaw   += s_yaw_user * YAW_SIGN * d[YAW_AXIS] / c;
+                s_pitch += dpitch;
             }
         }
         memcpy(s_prev, cur, sizeof(cur));
         s_have_prev = true;
+
+        // --- акселерометр: поправка наклона ---
+        float ax = st.acceleration.x, ay = st.acceleration.y, az = st.acceleration.z;
+        float g = sqrtf(ax*ax + ay*ay + az*az);
+        if (g > 0.85f && g < 1.15f) {             // консоль не трясут
+            float a[3] = { ax / g, ay / g, az / g };
+            if (!s_have_up) { memcpy(s_up, a, sizeof a); s_have_up = true; }
+            for (int i = 0; i < 3; i++) s_up[i] += (a[i] - s_up[i]) * 0.2f;
+
+            // угол «вверх» в плоскости, перпендикулярной оси кивка (оси Y и Z датчика)
+            float ang = atan2f(s_up[2], s_up[1]);
+            if (!s_have_ref) {
+                s_ref_ang = ang;
+                s_prev_acc_pitch = 0;
+                s_have_ref = true;
+            } else {
+                float acc_pitch = wrap_pi(ang - s_ref_ang);
+                // определяем, в какую сторону акселерометр считает наклон
+                // относительно гироскопа (по совпадению движений)
+                float dacc = wrap_pi(acc_pitch - s_prev_acc_pitch);
+                if (fabsf(dacc) < 0.3f) s_corr += dpitch * dacc;
+                s_prev_acc_pitch = acc_pitch;
+
+                if (fabsf(s_corr) > 0.01f) {      // знак уже понятен
+                    float target = (s_corr > 0 ? 1.0f : -1.0f) * acc_pitch;
+                    float k = 1.0f - expf(-dt / ACC_TAU);
+                    s_pitch += (target - s_pitch) * k;
+                }
+            }
+        }
     }
 
-    // правый стик — ручной обзор (удобно без очков или если гироскоп недоступен)
+    if (s_pitch >  PITCH_LIMIT) s_pitch =  PITCH_LIMIT;
+    if (s_pitch < -PITCH_LIMIT) s_pitch = -PITCH_LIMIT;
+    s_yaw = wrap_pi(s_yaw);
+
+    // правый стик — ручной обзор
     HidAnalogStickState rs = padGetStickPos(pad, 1);
     float sx = rs.x / 32767.0f, sy = rs.y / 32767.0f;
     if (fabsf(sx) < 0.15f) sx = 0;
@@ -106,23 +161,18 @@ void gyro_update(PadState *pad, float dt) {
 }
 
 // m — матрица 3x3 (по столбцам, как в GLSL): камера -> мир.
+// Положительный yaw — взгляд влево, положительный pitch — вверх.
 void gyro_matrix(float *m) {
-    float w = s_q[0], x = s_q[1], y = s_q[2], z = s_q[3];
-    float g[9] = { // столбцы
-        1 - 2*(y*y + z*z), 2*(x*y + w*z),     2*(x*z - w*y),
-        2*(x*y - w*z),     1 - 2*(x*x + z*z), 2*(y*z + w*x),
-        2*(x*z + w*y),     2*(y*z - w*x),     1 - 2*(x*x + y*y),
-    };
-    // стик: сначала поворот по горизонту (мировая ось Y), затем кивок
-    float cy = cosf(s_stick_yaw),   sy = sinf(s_stick_yaw);
-    float cp = cosf(s_stick_pitch), sp = sinf(s_stick_pitch);
-    float s[9] = { // Ry * Rx, по столбцам
+    float yaw   = s_yaw + s_stick_yaw;
+    float pitch = s_pitch + s_stick_pitch;
+    if (pitch >  PITCH_LIMIT) pitch =  PITCH_LIMIT;
+    if (pitch < -PITCH_LIMIT) pitch = -PITCH_LIMIT;
+    float cy = cosf(yaw),   sy = sinf(yaw);
+    float cp = cosf(pitch), sp = sinf(pitch);
+    float r[9] = { // Ry(yaw) * Rx(pitch), по столбцам
         cy,      0,  -sy,
         sy*sp,   cp,  cy*sp,
         sy*cp,  -sp,  cy*cp,
     };
-    // m = s * g
-    for (int c = 0; c < 3; c++)
-        for (int r = 0; r < 3; r++)
-            m[c*3 + r] = s[0*3 + r] * g[c*3 + 0] + s[1*3 + r] * g[c*3 + 1] + s[2*3 + r] * g[c*3 + 2];
+    memcpy(m, r, sizeof r);
 }
