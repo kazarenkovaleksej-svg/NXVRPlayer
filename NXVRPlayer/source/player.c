@@ -11,6 +11,7 @@
 #include <libswscale/swscale.h>
 #include <libavutil/channel_layout.h>
 #include <libavutil/imgutils.h>
+#include <libavutil/pixdesc.h>
 #include "player.h"
 
 #define FQ_MAX       48
@@ -51,6 +52,7 @@ struct Player {
     double             pause_clock, buffer_clock;
     double             clock_base, clock_time;
     double             audio_end_pts;
+    int                vframes;  // сколько кадров декодировано
 };
 
 static double ts_sec(int64_t ts, AVRational tb) {
@@ -77,6 +79,7 @@ static void queue_push(Player *p, AVFrame *f, double pts) {
     p->q[idx] = f;
     p->qpts[idx] = pts;
     p->qcount++;
+    p->vframes++;
     SDL_UnlockMutex(p->mtx);
 }
 
@@ -433,4 +436,11 @@ bool player_finished(Player *p) {
                (!p->adev || SDL_GetQueuedAudioSize(p->adev) == 0);
     SDL_UnlockMutex(p->mtx);
     return fin;
+}
+
+void player_stats(Player *p, char *out, size_t n) {
+    const AVPixFmtDescriptor *d = av_pix_fmt_desc_get(p->vctx->pix_fmt);
+    int bits = d ? d->comp[0].depth : 8;
+    snprintf(out, n, "%dX%d %s %dBIT D:%d", p->vctx->width, p->vctx->height,
+             p->vctx->codec->name, bits, p->vframes);
 }

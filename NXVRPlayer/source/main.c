@@ -47,6 +47,8 @@ static bool play_file(PadState *pad, const char *path, char *status, size_t stat
     double msg_until = 0;
     char msg[48] = "";
     float rot[9];
+    int shown = 0;
+    char info[96];
 
     #define SHOW_MSG(...) do { snprintf(msg, sizeof msg, __VA_ARGS__); msg_until = now_sec() + 2.0; } while (0)
 
@@ -115,8 +117,12 @@ static bool play_file(PadState *pad, const char *path, char *status, size_t stat
         AVFrame *f = player_take_frame(p, pos);
         if (f) {
             render_upload(f);
+            shown++;
             av_frame_free(&f);
         }
+
+        player_stats(p, info, sizeof info);
+        snprintf(info + strlen(info), sizeof info - strlen(info), " S:%d", shown);
 
         RenderParams rp = {
             .mode = s_set.mode,
@@ -130,6 +136,7 @@ static bool play_file(PadState *pad, const char *path, char *status, size_t stat
             .dur = dur,
             .paused = player_paused(p),
             .msg = t < msg_until ? msg : NULL,
+            .info = info,
         };
         render_draw(&rp);
 

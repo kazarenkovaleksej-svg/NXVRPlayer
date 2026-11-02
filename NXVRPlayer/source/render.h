@@ -13,6 +13,7 @@ typedef struct {
     double      pos, dur;
     bool        paused;
     const char *msg;         // короткое сообщение (или NULL)
+    const char *info;        // служебная строка (или NULL)
 } RenderParams;
 
 bool render_init(NWindow *win);

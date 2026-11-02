@@ -15,3 +15,4 @@ void     player_seek(Player *p, double target_sec);  // абсолютная п�
 double   player_duration(Player *p);
 bool     player_finished(Player *p);
 bool     player_has_audio(Player *p);
+void     player_stats(Player *p, char *out, size_t n); // служебная строка: размер, кодек, кадры

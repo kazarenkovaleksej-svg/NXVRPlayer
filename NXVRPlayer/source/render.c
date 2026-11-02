@@ -150,7 +150,7 @@ static void draw_osd(int x0, int w, int h, bool headset, const RenderParams *rp)
     snprintf(title, sizeof title, "%s%s", mode_name(rp->mode), rp->paused ? "  PAUSE" : "");
 
     // подложка
-    int box_h = line * 3 + 6 * px;
+    int box_h = line * (rp->info ? 4 : 3) + 6 * px;
     fill_rect(bar_x - 3 * px, bar_y - 3 * px, bar_w + 6 * px, box_h, 0.05f, 0.05f, 0.07f);
 
     // полоса прогресса
@@ -163,6 +163,8 @@ static void draw_osd(int x0, int w, int h, bool headset, const RenderParams *rp)
     }
     draw_text(bar_x, bar_y + line - px * 2, px, timebuf, 1, 1, 1);
     draw_text(bar_x, bar_y + line * 2, px, title, 1.0f, 0.85f, 0.3f);
+    if (rp->info && rp->info[0])
+        draw_text(bar_x, bar_y + line * 3, px, rp->info, 0.6f, 0.6f, 0.6f);
     if (rp->msg && rp->msg[0]) {
         int tw = text_width(rp->msg, px);
         draw_text(bar_x + bar_w - tw, bar_y + line * 2, px, rp->msg, 0.5f, 1.0f, 0.6f);
