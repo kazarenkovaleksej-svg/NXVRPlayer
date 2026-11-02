@@ -32,11 +32,7 @@ static bool play_file(PadState *pad, const char *path, char *status, size_t stat
         snprintf(status, status_len, "Error: %s", err);
         return true;
     }
-    if (!render_init(nwindowGetDefault())) {
-        snprintf(status, status_len, "Error: OpenGL init failed");
-        player_close(p);
-        return true;
-    }
+    render_reset_video();
 
     appletSetMediaPlaybackState(true); // не гасить экран во время просмотра
     s_set.mode = mode_guess(path);
@@ -48,8 +44,6 @@ static bool play_file(PadState *pad, const char *path, char *status, size_t stat
     double msg_until = 0;
     char msg[48] = "";
     float rot[9];
-    int shown = 0;
-    char info[96];
 
     #define SHOW_MSG(...) do { snprintf(msg, sizeof msg, __VA_ARGS__); msg_until = now_sec() + 2.0; } while (0)
 
@@ -129,12 +123,8 @@ static bool play_file(PadState *pad, const char *path, char *status, size_t stat
         AVFrame *f = player_take_frame(p, pos);
         if (f) {
             render_upload(f);
-            shown++;
             av_frame_free(&f);
         }
-
-        player_stats(p, info, sizeof info);
-        snprintf(info + strlen(info), sizeof info - strlen(info), " S:%d %s", shown, render_status());
 
         RenderParams rp = {
             .mode = s_set.mode,
@@ -149,7 +139,6 @@ static bool play_file(PadState *pad, const char *path, char *status, size_t stat
             .dur = dur,
             .paused = player_paused(p),
             .msg = t < msg_until ? msg : NULL,
-            .info = info,
         };
         render_draw(&rp);
 
@@ -157,7 +146,6 @@ static bool play_file(PadState *pad, const char *path, char *status, size_t stat
     }
 
     appletSetMediaPlaybackState(false);
-    render_exit();
     player_close(p);
     return keep_running;
 }
@@ -167,6 +155,20 @@ int main(int argc, char **argv) {
     PadState pad;
     padInitializeDefault(&pad);
     gyro_init();
+
+    // экран (видеокарта) включается один раз на всё время работы программы
+    if (!render_init(nwindowGetDefault())) {
+        consoleInit(NULL);
+        printf("\n  OpenGL init failed. Press + to exit.\n");
+        while (appletMainLoop()) {
+            padUpdate(&pad);
+            if (padGetButtonsDown(&pad) & HidNpadButton_Plus) break;
+            consoleUpdate(NULL);
+        }
+        consoleExit(NULL);
+        gyro_exit();
+        return 0;
+    }
 
     if (SDL_Init(SDL_INIT_AUDIO) < 0) {
         // без звука всё равно можно смотреть
@@ -180,14 +182,13 @@ int main(int argc, char **argv) {
     char status[160] = "";
 
     while (appletMainLoop()) {
-        consoleInit(NULL);
         bool picked = browser_run(&pad, cwd, sizeof cwd, path, sizeof path, status);
-        consoleExit(NULL);
         if (!picked) break;
         status[0] = 0;
         if (!play_file(&pad, path, status, sizeof status)) break;
     }
 
+    render_exit();
     SDL_Quit();
     gyro_exit();
     return 0;

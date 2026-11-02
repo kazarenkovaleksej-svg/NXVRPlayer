@@ -19,6 +19,13 @@ static EGLSurface s_surface;
 static GLuint s_prog, s_vao, s_vbo, s_tex[3];
 static char   s_status[48] = "SH:?";
 static const char *s_base = "SH:?";  // итог сборки шейдера
+
+// экран интерфейса (список файлов): рисуем на процессоре в буфер и выводим текстурой
+#define UI_W 1280
+#define UI_H 720
+static uint8_t *s_ui;                 // RGBA, UI_W x UI_H
+static GLuint   s_ui_prog, s_ui_tex;
+static bool     s_ui_dirty = true;
 static uint8_t *s_pack;      // буфер для плотной упаковки строк кадра
 static size_t  s_pack_size;
 static int    s_tw, s_th;
@@ -87,6 +94,13 @@ static const char *FS =
     "  oColor = vec4(rgb(uv), 1.0);\n"
     "}\n";
 
+static const char *FS_UI =
+    "#version 330 core\n"
+    "in vec2 vPos;\n"
+    "out vec4 oColor;\n"
+    "uniform sampler2D tUI;\n"
+    "void main(){ oColor = texture(tUI, vec2(vPos.x * 0.5 + 0.5, 0.5 - vPos.y * 0.5)); }\n";
+
 // Запасной шейдер: только обычное 2D, максимально простой GLSL.
 static const char *FS_FALLBACK =
     "#version 330 core\n"
@@ -105,7 +119,7 @@ static const char *FS_FALLBACK =
 
 // ---------------------------------------------------------------------------
 // Крошечный шрифт 3x5 для экранной панели (рисуется прямоугольниками glClear)
-static const char FONT_CHARS[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ:/.-+%";
+static const char FONT_CHARS[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ:/.-+%_()[],!'&#=?<>";
 static const unsigned char FONT[][5] = {
     {7,5,5,5,7},{2,6,2,2,7},{7,1,7,4,7},{7,1,7,1,7},{5,5,7,1,1},{7,4,7,1,7},{7,4,7,5,7},{7,1,1,2,2},
     {7,5,7,5,7},{7,5,7,1,7},
@@ -114,7 +128,32 @@ static const unsigned char FONT[][5] = {
     {2,5,5,6,3},{6,5,6,5,5},{3,4,2,1,6},{7,2,2,2,2},{5,5,5,5,7},{5,5,5,5,2},{5,5,7,7,5},{5,5,2,5,5},
     {5,5,2,2,2},{7,1,2,4,7},
     {0,2,0,2,0},{1,1,2,4,4},{0,0,0,0,2},{0,0,7,0,0},{0,2,7,2,0},{5,1,2,4,5},
+    {0,0,0,0,7},{1,2,2,2,1},{4,2,2,2,4},{3,2,2,2,3},{6,2,2,2,6},{0,0,0,2,4},{2,2,2,0,2},{2,2,0,0,0},
+    {2,5,2,5,3},{5,7,5,7,5},{0,7,0,7,0},{6,1,2,0,2},{1,2,4,2,1},{4,2,1,2,4},
 };
+
+// Следующий символ строки (UTF-8): возвращает узор 3x5 или NULL (пробел).
+// Символы, которых нет в шрифте (например, русские буквы), рисуются как «?».
+static const unsigned char *next_glyph(const char **ps) {
+    const unsigned char *s = (const unsigned char *)*ps;
+    unsigned char ch = *s++;
+    if (ch >= 0x80) {                         // многобайтовый символ UTF-8
+        while ((*s & 0xC0) == 0x80) s++;
+        *ps = (const char *)s;
+        return FONT[strchr(FONT_CHARS, '?') - FONT_CHARS];
+    }
+    *ps = (const char *)s;
+    if (ch >= 'a' && ch <= 'z') ch -= 32;
+    if (ch == ' ' || ch == 0) return NULL;
+    const char *f = strchr(FONT_CHARS, ch);
+    return f ? FONT[f - FONT_CHARS] : FONT[strchr(FONT_CHARS, '?') - FONT_CHARS];
+}
+
+static int utf8_len(const char *s) {
+    int n = 0;
+    for (; *s; s++) if ((*s & 0xC0) != 0x80) n++;
+    return n;
+}
 
 static void fill_rect(int x, int y, int w, int h, float r, float g, float b) {
     if (w <= 0 || h <= 0) return;
@@ -123,15 +162,12 @@ static void fill_rect(int x, int y, int w, int h, float r, float g, float b) {
     glClear(GL_COLOR_BUFFER_BIT);
 }
 
-static int text_width(const char *s, int px) { return (int)strlen(s) * 4 * px - px; }
+static int text_width(const char *s, int px) { return utf8_len(s) * 4 * px - px; }
 
 static void draw_text(int x, int y, int px, const char *s, float r, float g, float b) {
-    for (int i = 0; s[i]; i++) {
-        char ch = s[i];
-        if (ch >= 'a' && ch <= 'z') ch -= 32;
-        const char *f = strchr(FONT_CHARS, ch);
-        if (!f || ch == 0) continue;
-        const unsigned char *gl = FONT[f - FONT_CHARS];
+    for (int i = 0; *s; i++) {
+        const unsigned char *gl = next_glyph(&s);
+        if (!gl) continue;
         for (int row = 0; row < 5; row++) {
             int col = 0;
             while (col < 3) { // объединяем подряд идущие пиксели в один прямоугольник
@@ -311,7 +347,22 @@ bool render_init(NWindow *win) {
     glGenTextures(3, s_tex);
     s_tw = s_th = 0;
     s_has_frame = false;
-    return true;
+
+    // интерфейс
+    s_ui = calloc(UI_W * UI_H, 4);
+    s_ui_prog = build_program(VS, FS_UI);
+    glGenTextures(1, &s_ui_tex);
+    glBindTexture(GL_TEXTURE_2D, s_ui_tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, UI_W, UI_H, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    if (s_ui_prog) {
+        glUseProgram(s_ui_prog);
+        glUniform1i(glGetUniformLocation(s_ui_prog, "tUI"), 0);
+    }
+    return s_ui != NULL;
 }
 
 void render_exit(void) {
@@ -320,6 +371,9 @@ void render_exit(void) {
     glDeleteBuffers(1, &s_vbo);
     glDeleteVertexArrays(1, &s_vao);
     glDeleteProgram(s_prog);
+    if (s_ui_prog) glDeleteProgram(s_ui_prog);
+    glDeleteTextures(1, &s_ui_tex);
+    free(s_ui); s_ui = NULL;
     free(s_pack); s_pack = NULL; s_pack_size = 0;
     eglMakeCurrent(s_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
     eglDestroyContext(s_display, s_context);
@@ -439,3 +493,61 @@ void render_draw(const RenderParams *rp) {
 }
 
 const char *render_status(void) { return s_status; }
+
+void render_reset_video(void) { s_has_frame = false; }
+
+// ---------------------------------------------------------------------------
+// Интерфейс: координаты от левого верхнего угла, экран 1280x720
+void ui_clear(uint32_t rgb) { ui_rect(0, 0, UI_W, UI_H, rgb); }
+
+void ui_rect(int x, int y, int w, int h, uint32_t rgb) {
+    if (!s_ui) return;
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > UI_W) w = UI_W - x;
+    if (y + h > UI_H) h = UI_H - y;
+    if (w <= 0 || h <= 0) return;
+    s_ui_dirty = true;
+    uint32_t px = 0xFF000000u | ((rgb & 0xFF) << 16) | (rgb & 0xFF00) | ((rgb >> 16) & 0xFF); // RGBA в памяти
+    for (int j = 0; j < h; j++) {
+        uint32_t *row = (uint32_t *)s_ui + (size_t)(y + j) * UI_W + x;
+        for (int i = 0; i < w; i++) row[i] = px;
+    }
+}
+
+int ui_text_width(const char *s, int px) { return text_width(s, px); }
+
+void ui_text(int x, int y, int px, const char *s, int max_chars, uint32_t rgb) {
+    for (int i = 0; *s && (max_chars <= 0 || i < max_chars); i++) {
+        const unsigned char *gl = next_glyph(&s);
+        if (!gl) continue;
+        for (int row = 0; row < 5; row++)
+            for (int col = 0; col < 3; col++)
+                if (gl[row] & (4 >> col))
+                    ui_rect(x + (i * 4 + col) * px, y + row * px, px, px, rgb);
+    }
+}
+
+void ui_present(void) {
+    EGLint W = 1280, H = 720;
+    eglQuerySurface(s_display, s_surface, EGL_WIDTH, &W);
+    eglQuerySurface(s_display, s_surface, EGL_HEIGHT, &H);
+    if (W <= 0 || H <= 0 || W > 4096 || H > 4096) { W = 1280; H = 720; }
+    glDisable(GL_SCISSOR_TEST);
+    glViewport(0, 0, W, H);
+    glClearColor(0, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    if (s_ui && s_ui_prog) {
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, s_ui_tex);
+        if (s_ui_dirty) {
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, UI_W, UI_H, GL_RGBA, GL_UNSIGNED_BYTE, s_ui);
+            s_ui_dirty = false;
+        }
+        glUseProgram(s_ui_prog);
+        glBindVertexArray(s_vao);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    }
+    eglSwapBuffers(s_display, s_surface);
+}

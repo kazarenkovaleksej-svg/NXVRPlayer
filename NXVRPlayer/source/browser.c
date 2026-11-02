@@ -1,4 +1,5 @@
-// Простой файловый браузер в текстовой консоли libnx.
+// Файловый браузер. Рисуется через видеокарту (тем же способом, что и видео),
+// поэтому переход «список -> видео -> список» не переключает режимы экрана.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -6,9 +7,24 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include "browser.h"
+#include "render.h"
 
 #define MAX_ENTRIES 2048
-#define LIST_ROWS   36
+#define PX          3                     // размер «пикселя» шрифта
+#define CHAR_W      (4 * PX)
+#define LINE_H      (8 * PX)
+#define LIST_TOP    (LINE_H * 3 + 8)
+#define LIST_ROWS   24
+#define MAX_CHARS   100
+
+#define C_BG     0x101218
+#define C_TITLE  0x4FC3F7
+#define C_PATH   0xFFD54F
+#define C_TEXT   0xE0E0E0
+#define C_DIR    0x90CAF9
+#define C_SEL_BG 0x2E5C8A
+#define C_DIM    0x888888
+#define C_ERR    0xFF6E6E
 
 typedef struct { char name[256]; bool dir; } Entry;
 static Entry s_entries[MAX_ENTRIES];
@@ -61,28 +77,48 @@ static void go_parent(char *cwd) {
 }
 
 static void draw(const char *cwd, int sel, int top, const char *status) {
-    printf("\x1b[2J\x1b[1;1H");
-    printf("\x1b[36m NX VR Player\x1b[0m  -  video / 3D / VR180 / VR360\n");
-    printf(" \x1b[33m%.76s\x1b[0m\n", cwd);
-    printf("--------------------------------------------------------------------------------");
-    if (s_count == 0) printf("\n  (no video files here)\n");
+    ui_clear(C_BG);
+    ui_text(20, 12, PX, "NX VR PLAYER  -  VIDEO / 3D / VR180 / VR360", 0, C_TITLE);
+    ui_text(20, 12 + LINE_H, PX, cwd, MAX_CHARS, C_PATH);
+    ui_rect(20, LIST_TOP - 6, 1240, 2, 0x333844);
+
+    if (s_count == 0)
+        ui_text(40, LIST_TOP + 10, PX, "(NO VIDEO FILES HERE - PRESS B TO GO UP)", 0, C_DIM);
+
     for (int i = top; i < s_count && i < top + LIST_ROWS; i++) {
         const Entry *e = &s_entries[i];
-        printf("\x1b[%d;1H", 4 + (i - top));
-        if (i == sel) printf("\x1b[47;30m");
-        printf(" %s %-74.74s", e->dir ? "[D]" : "   ", e->name);
-        printf("\x1b[0m");
+        int y = LIST_TOP + (i - top) * LINE_H;
+        if (i == sel) ui_rect(16, y - 5, 1248, LINE_H, C_SEL_BG);
+        if (e->dir) ui_text(24, y, PX, "[D]", 0, C_DIR);
+        ui_text(24 + CHAR_W * 4, y, PX, e->name, MAX_CHARS - 6, e->dir ? C_DIR : C_TEXT);
     }
-    printf("\x1b[41;1H--------------------------------------------------------------------------------");
-    printf("\x1b[42;1H A: open   B: up   L/R: page   +: exit");
-    printf("\x1b[43;1H Put videos in sdmc:/videos/   %d item(s)", s_count);
-    if (status && status[0]) printf("\x1b[44;1H \x1b[31m%.78s\x1b[0m", status);
-    consoleUpdate(NULL);
+
+    // полоса прокрутки
+    if (s_count > LIST_ROWS) {
+        int track = LIST_ROWS * LINE_H;
+        int bar = track * LIST_ROWS / s_count;
+        if (bar < 12) bar = 12;
+        int pos = (track - bar) * top / (s_count - LIST_ROWS);
+        ui_rect(1268, LIST_TOP - 5, 4, track, 0x2A2E38);
+        ui_rect(1268, LIST_TOP - 5 + pos, 4, bar, 0x6A7080);
+    }
+
+    int by = 720 - LINE_H * 2 - 8;
+    ui_rect(20, by - 8, 1240, 2, 0x333844);
+    char line[96];
+    snprintf(line, sizeof line, "A: OPEN   B: UP   L/R: PAGE   +: EXIT        %d ITEM(S)", s_count);
+    ui_text(20, by, PX, line, 0, C_DIM);
+    if (status && status[0]) ui_text(20, by + LINE_H, PX, status, MAX_CHARS, C_ERR);
+    ui_present();
 }
 
 bool browser_run(PadState *pad, char *cwd, size_t cwd_len, char *out, size_t out_len, char *status) {
     scan_dir(cwd);
-    int sel = 0, top = 0, hold = 0;
+    static int sel = 0, top = 0;     // запоминаем позицию в списке между просмотрами
+    static char last_dir[768];
+    if (strcmp(last_dir, cwd) != 0) { sel = top = 0; snprintf(last_dir, sizeof last_dir, "%s", cwd); }
+    if (sel >= s_count) sel = s_count ? s_count - 1 : 0;
+    int hold = 0;
     bool dirty = true;
 
     while (appletMainLoop()) {
@@ -114,6 +150,7 @@ bool browser_run(PadState *pad, char *cwd, size_t cwd_len, char *out, size_t out
             go_parent(cwd);
             scan_dir(cwd);
             sel = top = 0;
+            snprintf(last_dir, sizeof last_dir, "%s", cwd);
             status[0] = 0;
             dirty = true;
         }
@@ -125,6 +162,7 @@ bool browser_run(PadState *pad, char *cwd, size_t cwd_len, char *out, size_t out
                 snprintf(cwd + len, cwd_len - len, "%s/", e->name);
                 scan_dir(cwd);
                 sel = top = 0;
+                snprintf(last_dir, sizeof last_dir, "%s", cwd);
                 status[0] = 0;
                 dirty = true;
             } else {
@@ -137,7 +175,7 @@ bool browser_run(PadState *pad, char *cwd, size_t cwd_len, char *out, size_t out
         if (sel >= top + LIST_ROWS) top = sel - LIST_ROWS + 1;
 
         if (dirty) { draw(cwd, sel, top, status); dirty = false; }
-        else consoleUpdate(NULL);
+        else ui_present();   // перерисовка той же картинки (держит ритм 60 кадров/с)
     }
     return false;
 }
