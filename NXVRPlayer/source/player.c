@@ -262,8 +262,13 @@ Player *player_open(const char *path, char *err, size_t errlen) {
     if (!p) { snprintf(err, errlen, "Out of memory"); return NULL; }
     p->vs = p->as = -1;
 
-    if (avformat_open_input(&p->fmt, path, NULL, NULL) < 0) {
-        snprintf(err, errlen, "Cannot open file");
+        char url[1100];
+    snprintf(url, sizeof url, "file:%s", path);
+    int r = avformat_open_input(&p->fmt, url, NULL, NULL);
+    if (r < 0) {
+        char e[96];
+        av_strerror(r, e, sizeof e);
+        snprintf(err, errlen, "Cannot open file (%s)", e);
         goto fail;
     }
     if (avformat_find_stream_info(p->fmt, NULL) < 0) {
