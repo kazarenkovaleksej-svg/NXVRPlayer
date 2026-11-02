@@ -19,9 +19,10 @@ typedef struct {
     float    scale3d;    // размер экрана в режиме 3D SBS
     float    ipd;
     bool     distort;
+    bool     single;     // один экран (true) или два для очков (false)
 } Settings;
 
-static Settings s_set = { MODE_FLAT, 75.0f, 95.0f, 0.80f, 0.0f, true };
+static Settings s_set = { MODE_FLAT, 75.0f, 95.0f, 0.80f, 0.0f, true, true };
 
 // Возвращает false, если пользователь нажал «+» (выход из программы)
 static bool play_file(PadState *pad, const char *path, char *status, size_t status_len) {
@@ -81,12 +82,23 @@ static bool play_file(PadState *pad, const char *path, char *status, size_t stat
             gyro_recenter();
         }
         if (down & HidNpadButton_X) { gyro_recenter(); SHOW_MSG("CENTER"); }
+        // «−»: один экран / два экрана для VR-очков
         if (down & HidNpadButton_Minus) {
+            s_set.single = !s_set.single;
+            SHOW_MSG("%s", s_set.single ? "1 SCREEN" : "2 SCREENS VR");
+        }
+        // нажатие левого стика: инвертировать поворот влево/вправо
+        if (down & HidNpadButton_StickL) {
+            bool inv = gyro_toggle_yaw_invert();
+            SHOW_MSG("TURN %s", inv ? "INVERTED" : "NORMAL");
+        }
+        // нажатие правого стика: коррекция линз
+        if (down & HidNpadButton_StickR) {
             s_set.distort = !s_set.distort;
             SHOW_MSG("LENS %s", s_set.distort ? "ON" : "OFF");
         }
 
-        bool headset = mode_is_headset(s_set.mode);
+        bool headset = mode_is_headset(s_set.mode) && !s_set.single;
         // вверх/вниз: в очках — межзрачковое расстояние, без очков — ничего
         if (headset && (down & HidNpadButton_Up))   { s_set.ipd += 0.01f; SHOW_MSG("IPD %+.2f", s_set.ipd); }
         if (headset && (down & HidNpadButton_Down)) { s_set.ipd -= 0.01f; SHOW_MSG("IPD %+.2f", s_set.ipd); }
@@ -130,6 +142,7 @@ static bool play_file(PadState *pad, const char *path, char *status, size_t stat
             .fov_deg = headset ? s_set.fov_vr : s_set.fov_flat,
             .screen_scale = s_set.scale3d,
             .distort = s_set.distort,
+            .single = s_set.single,
             .ipd = s_set.ipd,
             .osd = t < osd_until || player_paused(p),
             .pos = pos,

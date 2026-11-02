@@ -11,10 +11,10 @@
 // или знак (+1/-1) здесь и пересоберите.
 #define PITCH_AXIS 0   // кивок вверх/вниз
 #define PITCH_SIGN (+1.0f)
-#define YAW_AXIS   2   // поворот влево/вправо
-#define YAW_SIGN   (+1.0f)
-#define ROLL_AXIS  1   // наклон головы к плечу
-#define ROLL_SIGN  (-1.0f)
+#define YAW_AXIS   1   // поворот влево/вправо
+#define YAW_SIGN   (-1.0f)
+#define ROLL_AXIS  2   // наклон головы к плечу
+#define ROLL_SIGN  (+1.0f)
 // -----------------------------------------------------------------------------
 
 #define TWO_PI 6.28318530718f
@@ -24,6 +24,9 @@ static float s_q[4];                   // ориентация камеры (w, 
 static float s_prev[3];
 static bool  s_have_prev;
 static float s_stick_yaw, s_stick_pitch;
+static float s_yaw_user = 1.0f;       // -1: инвертировать поворот влево/вправо (кнопка в плеере)
+
+bool gyro_toggle_yaw_invert(void) { s_yaw_user = -s_yaw_user; return s_yaw_user < 0; }
 
 static void q_identity(float *q) { q[0] = 1; q[1] = q[2] = q[3] = 0; }
 
@@ -76,7 +79,7 @@ void gyro_update(PadState *pad, float dt) {
                 d[i] *= TWO_PI;                // в радианы
             }
             // вектор малого поворота в системе камеры (x вправо, y вверх, z назад)
-            float v[3] = { PITCH_SIGN * d[PITCH_AXIS], YAW_SIGN * d[YAW_AXIS], ROLL_SIGN * d[ROLL_AXIS] };
+            float v[3] = { PITCH_SIGN * d[PITCH_AXIS], s_yaw_user * YAW_SIGN * d[YAW_AXIS], ROLL_SIGN * d[ROLL_AXIS] };
             float ang = sqrtf(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]);
             if (ang > 1e-6f && ang < 1.0f) {
                 float s = sinf(ang * 0.5f) / ang;

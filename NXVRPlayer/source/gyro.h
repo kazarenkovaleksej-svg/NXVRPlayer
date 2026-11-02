@@ -6,3 +6,4 @@ void gyro_exit(void);
 void gyro_recenter(void);                 // «смотреть прямо» = текущее положение
 void gyro_update(PadState *pad, float dt); // вызывать каждый кадр
 void gyro_matrix(float *m);               // 3x3, column-major: камера -> мир
+bool gyro_toggle_yaw_invert(void);        // true — поворот влево/вправо инвертирован

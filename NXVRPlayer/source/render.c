@@ -386,7 +386,7 @@ void render_draw(const RenderParams *rp) {
     glClearColor(0, 0, 0, 1);
     glClear(GL_COLOR_BUFFER_BIT);
 
-    bool headset = mode_is_headset(rp->mode);
+    bool headset = mode_is_headset(rp->mode) && !rp->single;
     int eyes = headset ? 2 : 1;
     int ew = W / eyes;
     float view_aspect = (float)ew / (float)H;
