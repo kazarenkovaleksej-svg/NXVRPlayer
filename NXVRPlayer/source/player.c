@@ -262,7 +262,9 @@ Player *player_open(const char *path, char *err, size_t errlen) {
     if (!p) { snprintf(err, errlen, "Out of memory"); return NULL; }
     p->vs = p->as = -1;
 
-        char url[1100];
+    // На Switch пути выглядят как "sdmc:/videos/a.mp4". FFmpeg принял бы "sdmc:"
+    // за имя сетевого протокола, поэтому явно указываем протокол file:
+    char url[1100];
     snprintf(url, sizeof url, "file:%s", path);
     int r = avformat_open_input(&p->fmt, url, NULL, NULL);
     if (r < 0) {
