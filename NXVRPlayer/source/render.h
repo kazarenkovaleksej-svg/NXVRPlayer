@@ -20,3 +20,4 @@ bool render_init(NWindow *win);
 void render_exit(void);
 void render_upload(const AVFrame *f);
 void render_draw(const RenderParams *rp);
+const char *render_status(void); // состояние шейдера и ошибки GL для панели

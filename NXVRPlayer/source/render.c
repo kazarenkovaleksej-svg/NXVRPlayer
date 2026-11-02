@@ -17,6 +17,10 @@ static EGLContext s_context;
 static EGLSurface s_surface;
 
 static GLuint s_prog, s_vao, s_vbo, s_tex[3];
+static char   s_status[48] = "SH:?";
+static const char *s_base = "SH:?";  // итог сборки шейдера
+static uint8_t *s_pack;      // буфер для плотной упаковки строк кадра
+static size_t  s_pack_size;
 static int    s_tw, s_th;
 static bool   s_has_frame, s_full_range, s_bt709;
 static float  s_frame_aspect = 16.0f / 9.0f;
@@ -81,6 +85,22 @@ static const char *FS =
     "    }\n"
     "  }\n"
     "  oColor = vec4(rgb(uv), 1.0);\n"
+    "}\n";
+
+// Запасной шейдер: только обычное 2D, максимально простой GLSL.
+static const char *FS_FALLBACK =
+    "#version 330 core\n"
+    "in vec2 vPos;\n"
+    "out vec4 oColor;\n"
+    "uniform sampler2D tY;\n"
+    "uniform sampler2D tU;\n"
+    "uniform sampler2D tV;\n"
+    "void main(){\n"
+    "  vec2 uv = vec2(vPos.x * 0.5 + 0.5, 0.5 - vPos.y * 0.5);\n"
+    "  float y = (texture(tY, uv).r - 0.0627) * 1.1644;\n"
+    "  float u = texture(tU, uv).r - 0.5;\n"
+    "  float v = texture(tV, uv).r - 0.5;\n"
+    "  oColor = vec4(y + 1.793*v, y - 0.213*u - 0.533*v, y + 2.112*u, 1.0);\n"
     "}\n";
 
 // ---------------------------------------------------------------------------
@@ -177,14 +197,38 @@ static GLuint compile(GLenum type, const char *src) {
     GLuint sh = glCreateShader(type);
     glShaderSource(sh, 1, &src, NULL);
     glCompileShader(sh);
-    GLint ok;
+    GLint ok = 0;
     glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
     if (!ok) {
         char log[1024];
         glGetShaderInfoLog(sh, sizeof log, NULL, log);
         printf("shader error: %s\n", log);
+        glDeleteShader(sh);
+        return 0;
     }
     return sh;
+}
+
+// Собирает программу; 0 — если не удалось
+static GLuint build_program(const char *vsrc, const char *fsrc) {
+    GLuint vs = compile(GL_VERTEX_SHADER, vsrc);
+    GLuint fs = compile(GL_FRAGMENT_SHADER, fsrc);
+    if (!vs || !fs) {
+        if (vs) glDeleteShader(vs);
+        if (fs) glDeleteShader(fs);
+        return 0;
+    }
+    GLuint prog = glCreateProgram();
+    glAttachShader(prog, vs);
+    glAttachShader(prog, fs);
+    glBindAttribLocation(prog, 0, "aPos");
+    glLinkProgram(prog);
+    glDeleteShader(vs);
+    glDeleteShader(fs);
+    GLint ok = 0;
+    glGetProgramiv(prog, GL_LINK_STATUS, &ok);
+    if (!ok) { glDeleteProgram(prog); return 0; }
+    return prog;
 }
 
 static bool init_egl(NWindow *win) {
@@ -226,18 +270,17 @@ fail:
 }
 
 bool render_init(NWindow *win) {
-    setenv("MESA_NO_ERROR", "1", 1);
     if (!init_egl(win)) return false;
     gladLoadGL();
 
-    GLuint vs = compile(GL_VERTEX_SHADER, VS);
-    GLuint fs = compile(GL_FRAGMENT_SHADER, FS);
-    s_prog = glCreateProgram();
-    glAttachShader(s_prog, vs);
-    glAttachShader(s_prog, fs);
-    glLinkProgram(s_prog);
-    glDeleteShader(vs);
-    glDeleteShader(fs);
+    s_prog = build_program(VS, FS);
+    if (s_prog) {
+        s_base = "SH:OK";
+    } else {
+        s_prog = build_program(VS, FS_FALLBACK);
+        s_base = s_prog ? "SH:FALLBACK" : "SH:FAIL";
+    }
+    snprintf(s_status, sizeof s_status, "%s", s_base);
     glUseProgram(s_prog);
 
     glUniform1i(glGetUniformLocation(s_prog, "tY"), 0);
@@ -277,6 +320,7 @@ void render_exit(void) {
     glDeleteBuffers(1, &s_vbo);
     glDeleteVertexArrays(1, &s_vao);
     glDeleteProgram(s_prog);
+    free(s_pack); s_pack = NULL; s_pack_size = 0;
     eglMakeCurrent(s_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
     eglDestroyContext(s_display, s_context);
     eglDestroySurface(s_display, s_surface);
@@ -305,10 +349,22 @@ void render_upload(const AVFrame *f) {
         int h = i ? (s_th + 1) / 2 : s_th;
         glActiveTexture(GL_TEXTURE0 + i);
         glBindTexture(GL_TEXTURE_2D, s_tex[i]);
-        glPixelStorei(GL_UNPACK_ROW_LENGTH, f->linesize[i]);
-        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RED, GL_UNSIGNED_BYTE, f->data[i]);
+        const uint8_t *src = f->data[i];
+        if (f->linesize[i] != w) {
+            // строки кадра с отступами — упаковываем плотно (без GL_UNPACK_ROW_LENGTH)
+            size_t need = (size_t)w * h;
+            if (need > s_pack_size) {
+                free(s_pack);
+                s_pack = malloc(need);
+                s_pack_size = s_pack ? need : 0;
+                if (!s_pack) return;
+            }
+            for (int y = 0; y < h; y++)
+                memcpy(s_pack + (size_t)y * w, f->data[i] + (size_t)y * f->linesize[i], w);
+            src = s_pack;
+        }
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RED, GL_UNSIGNED_BYTE, src);
     }
-    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
 
     s_full_range = f->color_range == AVCOL_RANGE_JPEG || f->format == AV_PIX_FMT_YUVJ420P;
     s_bt709 = f->colorspace == AVCOL_SPC_BT709 ||
@@ -323,6 +379,7 @@ void render_draw(const RenderParams *rp) {
     EGLint W = 1280, H = 720;
     eglQuerySurface(s_display, s_surface, EGL_WIDTH, &W);
     eglQuerySurface(s_display, s_surface, EGL_HEIGHT, &H);
+    if (W <= 0 || H <= 0 || W > 4096 || H > 4096) { W = 1280; H = 720; }
 
     glDisable(GL_SCISSOR_TEST);
     glViewport(0, 0, W, H);
@@ -364,6 +421,9 @@ void render_draw(const RenderParams *rp) {
             glUniform1i(u_bt709, s_bt709 ? 1 : 0);
             glUniform1f(u_shift, headset ? (eye == 0 ? rp->ipd : -rp->ipd) : 0.0f);
             glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+            GLenum e = glGetError();
+            if (e != GL_NO_ERROR) snprintf(s_status, sizeof s_status, "%s GL:%04X", s_base, e);
+            else                  snprintf(s_status, sizeof s_status, "%s", s_base);
         }
         if (rp->osd || !s_has_frame) {
             glViewport(0, 0, W, H);
@@ -377,3 +437,5 @@ void render_draw(const RenderParams *rp) {
     }
     eglSwapBuffers(s_display, s_surface);
 }
+
+const char *render_status(void) { return s_status; }

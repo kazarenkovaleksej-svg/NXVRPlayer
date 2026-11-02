@@ -122,7 +122,7 @@ static bool play_file(PadState *pad, const char *path, char *status, size_t stat
         }
 
         player_stats(p, info, sizeof info);
-        snprintf(info + strlen(info), sizeof info - strlen(info), " S:%d", shown);
+        snprintf(info + strlen(info), sizeof info - strlen(info), " S:%d %s", shown, render_status());
 
         RenderParams rp = {
             .mode = s_set.mode,
